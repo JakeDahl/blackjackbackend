@@ -197,7 +197,13 @@ class BlackjackGameState:
     MAX_PLAYERS = 5
 
     def __init__(self):
+        # Initialize 6-deck shoe for multiplayer
         self.deck = Deck()
+        for _ in range(5):
+            temp_deck = Deck()
+            self.deck.cards.extend(temp_deck.cards)
+        self.deck.shuffle()
+
         self.dealer_hand = BlackjackHand()
         self.players: Dict[int, PlayerState] = {}  # player_number -> PlayerState
         self.phase = 'waiting'  # waiting, betting, playing, dealer_turn, round_over
@@ -229,19 +235,36 @@ class BlackjackGameState:
         # Reset all players for new round
         for player in self.players.values():
             player.hand = BlackjackHand()
+            player.split_hand = None
             player.current_bet = 0
+            player.split_bet = 0
             player.has_bet = False
             player.has_acted = False
             player.stood = False
             player.busted = False
+            player.split_stood = False
+            player.split_busted = False
             player.result = None
+            player.split_result = None
             player.can_double_down = False
             player.can_split = False
+            player.has_split = False
+            player.playing_split_hand = False
 
         self.dealer_hand = BlackjackHand()
         self.phase = 'betting'
         self.current_player_turn = None
         self.round_active = True
+
+        # Check if deck needs reshuffling (less than 52 cards = 1 deck remaining)
+        # Reshuffle when running low to ensure enough cards for next round
+        if len(self.deck.cards) < 52:
+            print(f"Deck running low ({len(self.deck.cards)} cards), reshuffling 6-deck shoe")
+            self.deck = Deck()
+            for _ in range(5):
+                temp_deck = Deck()
+                self.deck.cards.extend(temp_deck.cards)
+            self.deck.shuffle()
 
     def place_bet(self, player_number: int, amount: int) -> bool:
         """Player places a bet"""
@@ -266,29 +289,41 @@ class BlackjackGameState:
         if self.phase != 'betting' or not self.all_bets_placed():
             raise Exception("Cannot start playing phase")
 
-        # Use multiple decks for multiplayer (6 decks is standard)
-        self.deck = Deck()
-        for _ in range(5):
-            temp_deck = Deck()
-            self.deck.cards.extend(temp_deck.cards)
-        self.deck.shuffle()
-
-        # Deal two cards to each player and dealer
+        # Deal two cards to each player who has placed a bet, and dealer
         for _ in range(2):
             for player in sorted(self.players.values(), key=lambda p: p.player_number):
-                player.hand.add_card(self.deck.deal(1)[0])
+                if player.has_bet:  # Only deal to players who have placed bets
+                    player.hand.add_card(self.deck.deal(1)[0])
             self.dealer_hand.add_card(self.deck.deal(1)[0])
 
-        # Check for blackjacks and set player options
-        for player in self.players.values():
-            player.can_double_down = True
-            player.can_split = (player.hand.cards[0].rank == player.hand.cards[1].rank and
-                              player.balance >= player.current_bet)
+        # Check if dealer has blackjack (casino rules - check before player actions)
+        if self.dealer_hand.is_blackjack():
+            # Dealer has blackjack - resolve all hands immediately
+            for player in self.players.values():
+                if player.has_bet:
+                    if player.hand.is_blackjack():
+                        player.result = 'push'
+                        player.balance += player.current_bet  # Return bet
+                    else:
+                        player.result = 'lose'
+                    player.has_acted = True
+                    player.stood = True
 
-            if player.hand.is_blackjack():
-                player.has_acted = True
-                player.stood = True
-                # Result determined after dealer plays
+            self.phase = 'round_over'
+            self.round_active = False
+            return
+
+        # Check for blackjacks and set player options for players who have bet
+        for player in self.players.values():
+            if player.has_bet:
+                player.can_double_down = True
+                player.can_split = (player.hand.cards[0].rank == player.hand.cards[1].rank and
+                                  player.balance >= player.current_bet)
+
+                if player.hand.is_blackjack():
+                    player.has_acted = True
+                    player.stood = True
+                    # Result determined after dealer plays
 
         self.phase = 'playing'
         self.current_player_turn = self._get_next_player_turn(None)
@@ -382,6 +417,35 @@ class BlackjackGameState:
             raise Exception("Not your turn")
 
         player = self.players[player_number]
+
+        # Check if playing split hand
+        if player.has_split and player.playing_split_hand:
+            # Double down on split hand
+            if not player.can_double_down:
+                raise Exception("Cannot double down")
+            if player.split_bet > player.balance:
+                raise Exception("Insufficient balance to double down")
+
+            player.balance -= player.split_bet
+            player.split_bet *= 2
+
+            player.split_hand.add_card(self.deck.deal(1)[0])
+            player.can_double_down = False
+            player.can_split = False
+
+            if player.split_hand.is_bust():
+                player.split_busted = True
+                player.split_result = 'lose'
+            else:
+                player.split_stood = True
+
+            player.has_acted = True
+            self.current_player_turn = self._get_next_player_turn(player_number)
+            if self.current_player_turn is None:
+                self.phase = 'dealer_turn'
+            return
+
+        # Double down on regular hand (or first hand if split)
         if not player.can_double_down:
             raise Exception("Cannot double down")
         if player.current_bet > player.balance:
@@ -393,7 +457,6 @@ class BlackjackGameState:
         player.hand.add_card(self.deck.deal(1)[0])
         player.can_double_down = False
         player.can_split = False
-        player.has_acted = True
 
         if player.hand.is_bust():
             player.busted = True
@@ -401,9 +464,14 @@ class BlackjackGameState:
         else:
             player.stood = True
 
-        self.current_player_turn = self._get_next_player_turn(player_number)
-        if self.current_player_turn is None:
-            self.phase = 'dealer_turn'
+        # If has split hand, switch to it
+        if player.has_split:
+            player.playing_split_hand = True
+        else:
+            player.has_acted = True
+            self.current_player_turn = self._get_next_player_turn(player_number)
+            if self.current_player_turn is None:
+                self.phase = 'dealer_turn'
 
     def split(self, player_number: int):
         """Player splits their hand into two separate hands"""
@@ -511,7 +579,7 @@ class BlackjackGameState:
                     player.balance += player.current_bet  # Return bet
                 elif player_blackjack:
                     player.result = 'blackjack'
-                    player.balance += int(player.current_bet * 2.5)  # 3:2 payout
+                    player.balance += int(int(player.current_bet) * 2.5)  # 3:2 payout
                 elif dealer_blackjack:
                     player.result = 'lose'
                 elif dealer_busted:
@@ -548,16 +616,27 @@ class BlackjackGameState:
         self.phase = 'round_over'
         self.round_active = False
 
-    def to_dict(self) -> Dict:
-        """Convert game state to dictionary"""
-        return {
-            'deck': [card.to_dict() for card in self.deck.cards],
+    def to_dict(self, include_deck: bool = False) -> Dict:
+        """Convert game state to dictionary
+
+        Args:
+            include_deck: If True, includes deck in output (for DynamoDB storage).
+                         If False, excludes deck (for WebSocket payload reduction).
+        """
+        result = {
             'dealer_hand': self.dealer_hand.to_dict(),
             'players': {str(num): player.to_dict() for num, player in self.players.items()},
             'phase': self.phase,
             'current_player_turn': self.current_player_turn,
-            'round_active': self.round_active
+            'round_active': self.round_active,
+            'cards_remaining': len(self.deck.cards)
         }
+
+        # Only include deck for DynamoDB storage, not for WebSocket responses
+        if include_deck:
+            result['deck'] = [card.to_dict() for card in self.deck.cards]
+
+        return result
 
     @staticmethod
     def from_dict(data: Dict) -> 'BlackjackGameState':

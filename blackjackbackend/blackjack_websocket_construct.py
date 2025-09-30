@@ -17,10 +17,13 @@ class BlackjackWebSocketConstruct(Construct):
     WebSocket API construct for real-time Blackjack game server
     """
 
-    def __init__(self, scope: Construct, construct_id: str, games_table: dynamodb.Table, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, games_table: dynamodb.Table,
+                 hands_history_table: dynamodb.Table, user_chips_table: dynamodb.Table, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         self.games_table = games_table
+        self.hands_history_table = hands_history_table
+        self.user_chips_table = user_chips_table
 
         # Create WebSocket sessions table for connection management
         self.sessions_table = dynamodb.Table(
@@ -67,6 +70,8 @@ class BlackjackWebSocketConstruct(Construct):
             environment={
                 "GAMES_TABLE_NAME": self.games_table.table_name,
                 "SESSIONS_TABLE_NAME": self.sessions_table.table_name,
+                "HANDS_HISTORY_TABLE_NAME": self.hands_history_table.table_name,
+                "USER_CHIPS_TABLE_NAME": self.user_chips_table.table_name,
             },
             log_retention=logs.RetentionDays.ONE_WEEK
         )
@@ -74,6 +79,8 @@ class BlackjackWebSocketConstruct(Construct):
         # Grant permissions to the WebSocket handler
         self.games_table.grant_read_write_data(self.websocket_handler)
         self.sessions_table.grant_read_write_data(self.websocket_handler)
+        self.hands_history_table.grant_read_write_data(self.websocket_handler)
+        self.user_chips_table.grant_read_write_data(self.websocket_handler)
 
         # Create integrations
         websocket_integration = apigatewayv2_integrations.WebSocketLambdaIntegration(

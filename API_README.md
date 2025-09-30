@@ -75,7 +75,7 @@ Create a new multiplayer blackjack table.
 - `user_id` (string, required): Unique identifier for the player
 - `apn_token` (string, required): Apple Push Notification token for the player
 - `visibility` (string, optional): Game visibility - "private" or "public" (default: "private")
-- `initial_balance` (integer, optional): Starting chip balance for all players (default: 1000)
+- `initial_balance` (integer, optional): Default starting chip balance for new users (default: 1000, but existing users use their persisted balance)
 
 **Response:**
 ```json
@@ -528,7 +528,40 @@ Retrieve current game state.
 
 ---
 
-### 10. Reconnect
+### 10. Get User Balance
+
+Retrieve a user's current chip balance.
+
+**Request:**
+```json
+{
+  "action": "get_balance",
+  "user_id": "unique_user_identifier"
+}
+```
+
+**Parameters:**
+- `user_id` (string, required): Unique identifier for the user
+
+**Response:**
+```json
+{
+  "type": "user_balance",
+  "data": {
+    "user_id": "unique_user_identifier",
+    "chip_balance": 1000
+  }
+}
+```
+
+**Notes:**
+- Returns the user's persisted chip balance from `blackjack-user-chips` table
+- If the user is new and has no balance record, automatically creates one with 1000 chips
+- This is useful for displaying balance before joining/creating a game
+
+---
+
+### 11. Reconnect
 
 Reconnect to an existing game after disconnection.
 
@@ -562,7 +595,7 @@ Reconnect to an existing game after disconnection.
 
 ---
 
-### 11. Leave Game
+### 12. Leave Game
 
 Leave the current game.
 
@@ -586,7 +619,140 @@ Leave the current game.
 }
 ```
 
-**Note:** If game is active and player leaves mid-round, the game is tombstoned.
+**Other Players Notified:**
+```json
+{
+  "type": "player_left",
+  "message": "Player 2 left the game",
+  "player_number": 2,
+  "game_state": {
+    "players": {
+      "1": { /* Only remaining players */ }
+    }
+  }
+}
+```
+
+**Notes:**
+- Other players receive a `player_left` notification when someone explicitly leaves
+- The leaving player is **removed from the game state** (players dictionary)
+- The game continues for remaining players with updated game state
+- The leaving player's session is removed from the game
+
+---
+
+### 13. Send Chat Message
+
+Send a chat message to all players in the game.
+
+**Request:**
+```json
+{
+  "action": "send_chat",
+  "game_id": "A1B2",
+  "message": "Good luck everyone!"
+}
+```
+
+**Parameters:**
+- `game_id` (string, required): Game identifier
+- `message` (string, required): Chat message text
+
+**Response:**
+```json
+{
+  "type": "chat_sent",
+  "data": {
+    "game_id": "A1B2",
+    "message": "Chat message sent",
+    "timestamp": 1234567890
+  }
+}
+```
+
+**All Players Receive:**
+```json
+{
+  "type": "chat_message",
+  "game_id": "A1B2",
+  "player_number": 1,
+  "user_id": "user123",
+  "message": "Good luck everyone!",
+  "timestamp": 1234567890
+}
+```
+
+**Notes:**
+- All players in the game (including the sender) receive the chat message
+- Messages include the sender's player_number and user_id for identification
+- Timestamp is Unix epoch time in seconds
+
+---
+
+### 14. Claim Ad Reward
+
+Claim chips reward after watching a rewarded advertisement.
+
+**Request:**
+```json
+{
+  "action": "claim_ad_reward",
+  "user_id": "unique_user_identifier",
+  "ad_network": "admob",
+  "ad_unit_id": "ca-app-pub-xxxxx"
+}
+```
+
+**Parameters:**
+- `user_id` (string, required): Unique identifier for the user
+- `ad_network` (string, optional): Ad network name (e.g., "admob", "unity") - for analytics
+- `ad_unit_id` (string, optional): Ad unit identifier - for analytics
+
+**Response:**
+```json
+{
+  "type": "ad_reward_claimed",
+  "data": {
+    "user_id": "unique_user_identifier",
+    "reward_amount": 100,
+    "new_balance": 1100,
+    "previous_balance": 1000,
+    "message": "Reward claimed! +100 chips",
+    "cooldown_seconds": 300,
+    "timestamp": 1234567890
+  }
+}
+```
+
+**Error Response (Cooldown Active):**
+```json
+{
+  "type": "error",
+  "message": "Ad cooldown active. Try again in 245 seconds.",
+  "timestamp": 1234567890
+}
+```
+
+**Configuration:**
+- **Reward Amount:** 100 chips per ad (configurable in `game_service.py`)
+- **Cooldown:** 5 minutes (300 seconds) between ads (configurable in `game_service.py`)
+- **Tracking:** Total ads watched is tracked per user in the database
+
+**Notes:**
+- Users can claim ad rewards once per cooldown period
+- Chip balance is immediately updated in the `blackjack-user-chips` table
+- The cooldown prevents abuse while allowing reasonable free chip earning
+- Ad network and unit ID are optional but help with analytics tracking
+- The system tracks `last_ad_claim` timestamp and `total_ads_watched` count per user
+
+**Usage Flow:**
+1. User initiates rewarded ad in app
+2. Ad network shows ad to user
+3. User completes watching the ad
+4. App receives ad completion callback from ad network
+5. App sends `claim_ad_reward` action to backend
+6. Backend validates cooldown and awards chips
+7. User's balance is updated and new balance is returned
 
 ---
 
@@ -594,11 +760,10 @@ Leave the current game.
 
 The `game_state` object contains all information about the current game:
 
+**Note:** The deck is stored server-side in DynamoDB but is **not included** in WebSocket responses to reduce payload size. Only visible cards (player hands and dealer hand) are sent to clients.
+
 ```json
 {
-  "deck": [
-    // Array of remaining cards (hidden from client in production)
-  ],
   "dealer_hand": [
     {"rank": "A", "suit": "clubs"},
     {"rank": "5", "suit": "spades"}
@@ -625,7 +790,8 @@ The `game_state` object contains all information about the current game:
   },
   "phase": "playing",
   "current_player_turn": 1,
-  "round_active": true
+  "round_active": true,
+  "cards_remaining": 298
 }
 ```
 
@@ -633,7 +799,7 @@ The `game_state` object contains all information about the current game:
 
 - `player_number`: Seat number (1-5)
 - `user_id`: Player's unique identifier
-- `balance`: Current chip balance
+- `balance`: Current chip balance (persisted in `blackjack-user-chips` table)
 - `hand`: Array of cards in player's hand
 - `current_bet`: Amount bet this round
 - `has_bet`: Boolean indicating if player has placed bet
@@ -651,6 +817,8 @@ The `game_state` object contains all information about the current game:
 - `has_split`: Boolean indicating if player has already split
 - `playing_split_hand`: Boolean indicating if currently playing split hand
 
+**Note:** Player balances are retrieved from and updated in the `blackjack-user-chips` table. New users start with 1000 chips, and returning users continue with their previous balance.
+
 ### Game Phases
 
 - `"waiting"`: Waiting for players to join or round to start
@@ -665,6 +833,14 @@ The `game_state` object contains all information about the current game:
 - Players act in order: Player 1, Player 2, Player 3, etc.
 - Only the current player can hit, stand, or double down
 - Turn automatically advances after each action
+
+### Deck Information
+
+- `cards_remaining`: Number of cards left in the deck (always included in game state)
+- Games use a 6-deck shoe (312 cards total at start)
+- The deck persists across rounds and is only reshuffled when fewer than 52 cards remain
+- Useful for card counting strategies and knowing when deck is running low
+- When the deck is reshuffled, players will see `cards_remaining` jump back to 312
 
 ### Round Results (per player)
 
@@ -777,9 +953,26 @@ Client sends actions
 ```
 Client disconnects (intentional or network issue)
 → Server cleans up session
+→ Other players notified with player_disconnected message
 → Game remains in DynamoDB
 → Player can reconnect to resume
 ```
+
+**Other Players Receive:**
+```json
+{
+  "type": "player_disconnected",
+  "message": "Player 2 disconnected",
+  "player_number": 2,
+  "game_state": {
+    "players": {
+      "1": { /* Only remaining players */ }
+    }
+  }
+}
+```
+
+**Note:** The disconnected player is **removed from the game state** immediately upon disconnection.
 
 ### 4. Reconnect
 ```
@@ -899,12 +1092,15 @@ All players in a game receive real-time notifications for:
 | Event | Notification Type | Triggered By |
 |-------|------------------|--------------|
 | Player joins | `player_joined` | join_game |
+| Player leaves | `player_left` | leave_game |
+| Player disconnects | `player_disconnected` | Connection closed |
 | Round starts | `betting_started` | start_round |
 | Player bets | `player_bet_placed` | place_bet |
 | Player hits | `player_hit` | hit |
 | Player stands | `player_stood` | stand |
 | Player doubles | `player_doubled_down` | double_down |
 | Player splits | `player_split` | split |
+| Chat message | `chat_message` | send_chat |
 | Dealer plays | Included in phase change | Automatic |
 
 ---
@@ -1012,9 +1208,44 @@ The backend is deployed on AWS with:
 - **DynamoDB Tables**:
   - `blackjack-games`: Game state storage (up to 5 players per game)
   - `blackjack-websocket-sessions`: Connection management
+  - `blackjack-hands-history`: Historical record of completed hands
+  - `blackjack-user-chips`: User chip balance persistence
 - **API Gateway**: WebSocket API
 - **Deck**: 6-deck shoe (312 cards) for multiplayer games
 - **Region**: Configurable via CDK deployment
+
+### Data Persistence
+
+#### User Chip Balances
+- New users automatically start with **1000 chips**
+- Chip balances persist across games and sessions
+- Updated automatically after each completed hand
+- Retrieved when creating or joining games
+- Users can earn additional chips by watching rewarded ads (100 chips per ad, 5-minute cooldown)
+- Tracks total ads watched and last ad claim time per user
+
+#### Hand History
+After each hand completes, the following data is saved to `blackjack-hands-history`:
+- **hand_id**: Unique identifier for the hand
+- **user_id**: Player's identifier
+- **game_id**: Game identifier
+- **timestamp**: When the hand was completed
+- **player_number**: Seat number in the game
+- **player_hand**: Cards in player's hand (with values)
+- **split_hand**: Cards in split hand (if applicable)
+- **dealer_hand**: Dealer's cards (with value)
+- **bet_amount**: Player's bet amount
+- **split_bet_amount**: Split bet amount (if applicable)
+- **result**: Hand result (win/lose/push/blackjack)
+- **split_result**: Split hand result (if applicable)
+- **chip_change**: Net chips won or lost
+- **final_balance**: Player's balance after the hand
+
+This allows for:
+- Player game history tracking
+- Statistics and analytics
+- Dispute resolution
+- Audit trails
 
 ---
 
@@ -1031,8 +1262,11 @@ The backend is deployed on AWS with:
 | `double_down` | `game_id` | `double_down_complete` | Yes - `player_doubled_down` |
 | `split` | `game_id` | `split_complete` | Yes - `player_split` |
 | `get_game` | `game_id` | `game_state` | No |
+| `get_balance` | `user_id` | `user_balance` | No |
 | `reconnect` | `game_id`, `user_id` | `reconnected` | No |
-| `leave_game` | `game_id` | `left_game` | No |
+| `leave_game` | `game_id` | `left_game` | Yes - `player_left` |
+| `send_chat` | `game_id`, `message` | `chat_sent` | Yes - `chat_message` |
+| `claim_ad_reward` | `user_id` | `ad_reward_claimed` | No |
 
 ---
 
@@ -1043,7 +1277,6 @@ Potential features not yet implemented:
 - Re-splitting (splitting already split hands)
 - Side bets
 - Spectator mode
-- Chat between players
 - Player profiles and stats
 - Achievements/badges
 - Tournament mode

@@ -15,6 +15,8 @@ from game_service import GameService
 dynamodb = boto3.resource('dynamodb')
 games_table = None
 sessions_table = None
+hands_history_table = None
+user_chips_table = None
 apigateway_client = None
 session_manager = None
 ws_utils = None
@@ -26,7 +28,7 @@ def handler(event, context):
     WebSocket handler for real-time blackjack gameplay
     """
     try:
-        global games_table, sessions_table, apigateway_client
+        global games_table, sessions_table, hands_history_table, user_chips_table, apigateway_client
         global session_manager, ws_utils, game_service
 
         # Initialize tables and client on first use
@@ -34,6 +36,10 @@ def handler(event, context):
             games_table = dynamodb.Table(os.environ.get('GAMES_TABLE_NAME', 'blackjack-games'))
         if sessions_table is None:
             sessions_table = dynamodb.Table(os.environ.get('SESSIONS_TABLE_NAME', 'blackjack-websocket-sessions'))
+        if hands_history_table is None:
+            hands_history_table = dynamodb.Table(os.environ.get('HANDS_HISTORY_TABLE_NAME', 'blackjack-hands-history'))
+        if user_chips_table is None:
+            user_chips_table = dynamodb.Table(os.environ.get('USER_CHIPS_TABLE_NAME', 'blackjack-user-chips'))
 
         # Create API Gateway management client with correct endpoint
         if apigateway_client is None:
@@ -48,7 +54,7 @@ def handler(event, context):
         if ws_utils is None:
             ws_utils = WebSocketUtils(apigateway_client)
         if game_service is None:
-            game_service = GameService(games_table, session_manager, ws_utils)
+            game_service = GameService(games_table, session_manager, ws_utils, hands_history_table, user_chips_table)
 
         connection_id = event['requestContext']['connectionId']
         route_key = event['requestContext']['routeKey']
@@ -100,7 +106,8 @@ def handle_disconnect(connection_id: str) -> Dict:
         # If user was in a game, handle cleanup
         if session and session.get('game_id'):
             game_id = session['game_id']
-            print(f"Player disconnected from game {game_id}")
+            player_number = session.get('player_number')
+            print(f"Player {player_number} disconnected from game {game_id}")
 
             # Get the game to check its status
             try:
@@ -110,11 +117,47 @@ def handle_disconnect(connection_id: str) -> Dict:
                     game = game_response['Item']
                     game_status = game.get('game_status')
 
-                    # Only notify if game is still active
+                    # Only process if game is still active
                     if game_status not in ['completed', 'tombstoned']:
-                        print(f"Game {game_id} is still active, player can reconnect")
-                        # In blackjack, since it's single player, we just mark it as available for reconnect
-                        # No need to notify other players
+                        print(f"Game {game_id} is still active, removing player {player_number}")
+
+                        # Remove player from game state
+                        from blackjack_models import BlackjackGameState
+                        game_state = BlackjackGameState.from_dict(game['game_state'])
+
+                        # Check if it was this player's turn
+                        was_players_turn = (game_state.current_player_turn == player_number)
+
+                        game_state.remove_player(player_number)
+
+                        # If it was their turn during playing phase, advance to next player
+                        if was_players_turn and game_state.phase == 'playing':
+                            game_state.current_player_turn = game_state._get_next_player_turn(None)
+                            # If no more players, trigger dealer turn
+                            if game_state.current_player_turn is None:
+                                game_state.phase = 'dealer_turn'
+                                game_state.dealer_play()
+
+                        # Update game in database
+                        games_table.update_item(
+                            Key={'game_id': game_id},
+                            UpdateExpression='SET game_state = :state',
+                            ExpressionAttributeValues={
+                                ':state': game_state.to_dict(include_deck=True)
+                            }
+                        )
+
+                        # Notify other players that this player disconnected
+                        game_sessions = session_manager.get_sessions_by_game(game_id)
+                        if game_sessions and ws_utils:
+                            for other_session in game_sessions:
+                                if other_session.get('connection_id') != connection_id:
+                                    ws_utils.send_message(other_session['connection_id'], {
+                                        'type': 'player_disconnected',
+                                        'message': f'Player {player_number} disconnected',
+                                        'player_number': player_number,
+                                        'game_state': game_state.to_dict()
+                                    })
 
             except Exception as e:
                 print(f"Error handling game on disconnect: {str(e)}")
@@ -159,10 +202,16 @@ def handle_default_message(event: Dict, connection_id: str) -> Dict:
             return ws_split(body, connection_id)
         elif action == 'get_game':
             return ws_get_game(body, connection_id)
+        elif action == 'get_balance':
+            return ws_get_balance(body, connection_id)
         elif action == 'reconnect':
             return ws_reconnect(body, connection_id)
         elif action == 'leave_game':
             return ws_leave_game(body, connection_id)
+        elif action == 'send_chat':
+            return ws_send_chat(body, connection_id)
+        elif action == 'claim_ad_reward':
+            return ws_claim_ad_reward(body, connection_id)
         else:
             return send_error(connection_id, f"Unknown action: {action}")
 
@@ -361,6 +410,25 @@ def ws_get_game(body: Dict, connection_id: str) -> Dict:
         return send_error(connection_id, str(e))
 
 
+def ws_get_balance(body: Dict, connection_id: str) -> Dict:
+    """WebSocket get user balance handler"""
+    try:
+        user_id = body.get('user_id')
+
+        if not user_id:
+            return send_error(connection_id, "user_id is required")
+
+        balance_info = game_service.get_user_balance(user_id)
+        return ws_utils.send_message(connection_id, {
+            'type': 'user_balance',
+            'data': balance_info
+        })
+
+    except Exception as e:
+        print(f"Get balance error: {str(e)}")
+        return send_error(connection_id, str(e))
+
+
 def ws_reconnect(body: Dict, connection_id: str) -> Dict:
     """WebSocket reconnect handler"""
     try:
@@ -429,6 +497,7 @@ def ws_leave_game(body: Dict, connection_id: str) -> Dict:
             return send_error(connection_id, 'You are not in this game')
 
         user_id = session.get('user_id')
+        player_number = session.get('player_number')
 
         # Get the game
         game_response = games_table.get_item(Key={'game_id': game_id})
@@ -436,21 +505,44 @@ def ws_leave_game(body: Dict, connection_id: str) -> Dict:
             return send_error(connection_id, 'Game not found')
 
         game = game_response['Item']
-        game_status = game.get('game_status')
 
-        # Only tombstone if game is not already completed
-        if game_status not in ['completed', 'tombstoned']:
-            print(f"Tombstoning game {game_id} - Player left")
+        # Remove player from game state
+        from blackjack_models import BlackjackGameState
+        game_state = BlackjackGameState.from_dict(game['game_state'])
 
-            games_table.update_item(
-                Key={'game_id': game_id},
-                UpdateExpression='SET game_status = :status, tombstone_reason = :reason, tombstone_by = :user_id',
-                ExpressionAttributeValues={
-                    ':status': 'tombstoned',
-                    ':reason': 'player_left',
-                    ':user_id': user_id if user_id else 'unknown'
-                }
-            )
+        # Check if it was this player's turn
+        was_players_turn = (game_state.current_player_turn == player_number)
+
+        game_state.remove_player(player_number)
+
+        # If it was their turn during playing phase, advance to next player
+        if was_players_turn and game_state.phase == 'playing':
+            game_state.current_player_turn = game_state._get_next_player_turn(None)
+            # If no more players, trigger dealer turn
+            if game_state.current_player_turn is None:
+                game_state.phase = 'dealer_turn'
+                game_state.dealer_play()
+
+        # Update game in database
+        games_table.update_item(
+            Key={'game_id': game_id},
+            UpdateExpression='SET game_state = :state',
+            ExpressionAttributeValues={
+                ':state': game_state.to_dict(include_deck=True)
+            }
+        )
+
+        # Notify other players
+        game_sessions = session_manager.get_sessions_by_game(game_id)
+        if game_sessions and ws_utils:
+            for other_session in game_sessions:
+                if other_session.get('connection_id') != connection_id:
+                    ws_utils.send_message(other_session['connection_id'], {
+                        'type': 'player_left',
+                        'message': f'Player {player_number} left the game',
+                        'player_number': player_number,
+                        'game_state': game_state.to_dict()
+                    })
 
         # Remove the session
         session_manager.remove_session(connection_id)
@@ -464,6 +556,51 @@ def ws_leave_game(body: Dict, connection_id: str) -> Dict:
     except Exception as e:
         print(f"Leave game error: {str(e)}")
         return send_error(connection_id, f"Leave game failed: {str(e)}")
+
+
+def ws_send_chat(body: Dict, connection_id: str) -> Dict:
+    """WebSocket send chat message handler"""
+    try:
+        game_id = body.get('game_id')
+        message = body.get('message')
+
+        if not game_id:
+            return send_error(connection_id, "game_id is required")
+        if not message:
+            return send_error(connection_id, "message is required")
+
+        result = game_service.send_chat(connection_id, game_id, message)
+
+        return ws_utils.send_message(connection_id, {
+            'type': 'chat_sent',
+            'data': result
+        })
+
+    except Exception as e:
+        print(f"Send chat error: {str(e)}")
+        return send_error(connection_id, str(e))
+
+
+def ws_claim_ad_reward(body: Dict, connection_id: str) -> Dict:
+    """WebSocket claim ad reward handler"""
+    try:
+        user_id = body.get('user_id')
+        ad_network = body.get('ad_network')
+        ad_unit_id = body.get('ad_unit_id')
+
+        if not user_id:
+            return send_error(connection_id, "user_id is required")
+
+        result = game_service.claim_ad_reward(user_id, ad_network, ad_unit_id)
+
+        return ws_utils.send_message(connection_id, {
+            'type': 'ad_reward_claimed',
+            'data': result
+        })
+
+    except Exception as e:
+        print(f"Claim ad reward error: {str(e)}")
+        return send_error(connection_id, str(e))
 
 
 def send_error(connection_id: str, error_message: str) -> Dict:
